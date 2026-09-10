@@ -2,14 +2,12 @@
 // @name         Canary Interceptor POC - Day 2
 // @namespace    canary-poc
 // @version      0.2
-// @description  Block uploads of files whose SHA-256 hash matches a local canary database
+// @description  Day 2: prove we can intercept and block file uploads before the page sees them
 // @match        https://chat.openai.com/*
 // @match        https://chatgpt.com/*
 // @match        https://claude.ai/*
 // @match        https://gemini.google.com/*
-// @grant        GM_xmlhttpRequest
-// @connect      127.0.0.1
-// @connect      localhost
+// @grant        none
 // @run-at       document-start
 // ==/UserScript==
 
@@ -17,11 +15,6 @@
   'use strict';
 
   const TAG = '[canary-poc]';
-  const BACKEND = 'http://127.0.0.1:5000';
-  // If the local backend is unreachable, do we allow the upload (fail open)
-  // or block it (fail closed)? Fail-open is friendlier for a dev POC —
-  // flip to false once you trust the setup and want a hard stop instead.
-  const FAIL_OPEN = true;
 
   async function hashFile(file) {
     const buf = await file.arrayBuffer();
@@ -29,104 +22,71 @@
     return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
   }
 
-  function checkHash(hash) {
-    return new Promise((resolve) => {
-      GM_xmlhttpRequest({
-        method: 'GET',
-        url: `${BACKEND}/check/${hash}`,
-        timeout: 3000,
-        onload: (res) => {
-          try {
-            resolve(JSON.parse(res.responseText));
-          } catch (err) {
-            console.warn(`${TAG} malformed response from backend`, err);
-            resolve({ match: false, error: true });
-          }
-        },
-        onerror: () => {
-          console.warn(`${TAG} backend unreachable — is canary_server.py running?`);
-          resolve({ match: !FAIL_OPEN, error: true });
-        },
-        ontimeout: () => resolve({ match: !FAIL_OPEN, error: true }),
-      });
-    });
-  }
-
-  async function evaluate(file) {
-    const hash = await hashFile(file);
-    const result = await checkHash(hash);
-    console.log(`${TAG} ${file.name} -> ${hash} -> match=${result.match}`);
-    return result;
-  }
-
-  // ---------- file input (click-to-upload) ----------
-
   async function handleFileInputChange(e) {
     const target = e.target;
     if (!target || target.tagName !== 'INPUT' || target.type !== 'file') return;
 
-    if (target.dataset.canaryPassed === 'true') {
-      // This is our own re-dispatched, already-vetted event — let it through.
-      delete target.dataset.canaryPassed;
-      return;
-    }
-
     const file = target.files && target.files[0];
     if (!file) return;
 
+    console.log(`${TAG} intercepted file:`, file.name, file.size, 'bytes, type:', file.type);
+
+    // --- Day 1 goal: prove we can stop the page from ever seeing this file ---
     e.stopImmediatePropagation();
     e.stopPropagation();
     e.preventDefault();
 
-    const { match, filename } = await evaluate(file);
-
-    if (match) {
-      try { target.value = ''; } catch (err) { /* some inputs are unclearable, ignore */ }
-      alert(`[Canary] Blocked upload: "${file.name}" matches registered canary${filename ? ` "${filename}"` : ''}.`);
-      return;
+    // Clear the input so the host page's own state doesn't retain a reference
+    try {
+      target.value = '';
+    } catch (err) {
+      console.warn(`${TAG} could not clear input value:`, err);
     }
 
-    // No match: mark vetted and re-fire the event so the site's own
-    // handler (React, etc.) still receives it normally.
-    target.dataset.canaryPassed = 'true';
-    target.dispatchEvent(new Event('change', { bubbles: true }));
-  }
+    const hash = await hashFile(file);
+    console.log(`${TAG} SHA256:`, hash);
 
-  // ---------- drag & drop ----------
+    alert(
+      `Your actions have been logged. Your supervisor will soon contact you.\n\n` +
+      `Blocked upload of: ${file.name}\n` +
+      `SHA256: ${hash}`
+    );
+  }
 
   async function handleDrop(e) {
-    if (e.__canaryPassed) return; // our own re-dispatch, already vetted
+    if (!e.dataTransfer || !e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
 
-    const dt = e.dataTransfer;
-    if (!dt || !dt.files || dt.files.length === 0) return;
+    const file = e.dataTransfer.files[0];
+    console.log(`${TAG} intercepted drop:`, file.name, file.size, 'bytes, type:', file.type);
 
     e.stopImmediatePropagation();
     e.stopPropagation();
     e.preventDefault();
 
-    const file = dt.files[0];
-    const { match, filename } = await evaluate(file);
+    const hash = await hashFile(file);
+    console.log(`${TAG} SHA256:`, hash);
 
-    if (match) {
-      alert(`[Canary] Blocked drag-and-drop upload: "${file.name}" matches registered canary${filename ? ` "${filename}"` : ''}.`);
-      return;
-    }
-
-    // Re-dispatch a synthetic drop carrying the same file(s) so the site's
-    // drop-zone still receives it. This is more fragile than the file-input
-    // path above — some sites gate drop handling on other dragenter/dragover
-    // state — so treat it as a starting point, not a guarantee.
-    const clone = new DataTransfer();
-    for (const f of dt.files) clone.items.add(f);
-    const redrop = new DragEvent('drop', { bubbles: true, cancelable: true });
-    Object.defineProperty(redrop, 'dataTransfer', { value: clone });
-    redrop.__canaryPassed = true;
-    e.target.dispatchEvent(redrop);
+    alert(
+      `Your actions have been logged. Your supervisor will soon contact you.\n\n` +
+      `Blocked drag-and-drop upload of: ${file.name}\n` +
+      `SHA256: ${hash}`
+    );
   }
 
+  // Capture phase (the `true` third arg) is critical for both listeners below:
+  // we need to run BEFORE the site's own React/JS listeners get a chance to
+  // read the file.
   document.addEventListener('change', handleFileInputChange, true);
-  document.addEventListener('dragover', (e) => e.preventDefault(), true);
+
+  // dragover must be prevented so the drop handler actually fires, but do NOT
+  // alert here: dragover fires continuously (many times/sec) while dragging,
+  // and dataTransfer.files is often empty/inaccessible until the 'drop' event.
+  document.addEventListener('dragover', (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+  }, true);
+
   document.addEventListener('drop', handleDrop, true);
 
-  console.log(`${TAG} Day 2 interceptor loaded on ${location.hostname} (backend: ${BACKEND})`);
+  console.log(`${TAG} Day 1 interceptor loaded on ${location.hostname}`);
 })();
